@@ -1,0 +1,378 @@
+---
+
+heat_template_version: 2016-10-14
+
+description: |-
+  An example Catalyst Cloud Orchestration Service template
+  for building a cluster of web servers with auto-scaling.
+
+  This provisions the following cloud resources:
+
+  * Security groups to control access to/from instances.
+  * An internal network for all instances.
+  * A bastion host with its own floating IP to allow SSH access
+    into the cluster.
+  * A load balancer to allow highly available access to the web servers
+    from the Internet, with its own floating IP.
+  * An auto-scaling group that launches, monitors and scales
+    a cluster of web server instances depending on the configured
+    load thresholds.
+
+parameters:
+  keypair:
+    description: The keypair to associate with launched web servers.
+    type: string
+    # Required.
+  bastion_image:
+    description: The image to use to launch the bastion host.
+    type: string
+    default: ubuntu-24.04-x86_64
+  bastion_flavor:
+    description: The flavour to launch the bastion host as.
+    type: string
+    default: c1.c1r1
+  webserver_image:
+    description: The image to use to launch the web servers.
+    type: string
+    default: ubuntu-24.04-x86_64
+  webserver_flavor:
+    description: The flavour to launch the web servers as.
+    type: string
+    default: c1.c1r1
+  webserver_group_policy:
+    description: The scheduling policy to apply to the web servers.
+    type: string
+    default: soft-anti-affinity
+  subnet_cidr:
+    description: The subnet to use for assigning internal network addresses.
+    type: string
+    default: 10.0.0.0/24
+  public_network:
+    description: The public network to get floating IPs from.
+    type: string
+    default: public-net
+  autoscaling_granularity:
+    description: The granularity to query metrics for auto-scaling.
+    type: number
+    default: 600
+  autoscaling_cpu_high_threshold:
+    description: The upper CPU usage percentage threshold for scaling out the web servers.
+    type: number
+    default: 20
+  autoscaling_cpu_low_threshold:
+    description: The lower CPU usage percentage threshold for scaling in the web servers.
+    type: number
+    default: 5
+  autoscaling_memory_high_threshold:
+    description: The upper memory usage percentage threshold for scaling out the web servers.
+    type: number
+    default: 75
+  autoscaling_memory_low_threshold:
+    description: The lower memory usage percentage threshold for scaling out the web servers.
+    type: number
+    default: 50
+
+resources:
+  # The internal network for the cluster.
+  network:
+    type: OS::Neutron::Net
+
+  # The subnet for the internal network.
+  subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network: {get_resource: network}
+      cidr: {get_param: subnet_cidr}
+
+  # The router for the internal network.
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: {get_param: public_network}
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: {get_resource: router}
+      subnet: {get_resource: subnet}
+
+  # The security group for SSH access via the bastion host.
+  internal_security_group:
+    type: OS::Neutron::SecurityGroup
+  internal_security_group_rule_ssh:
+    type: OS::Neutron::SecurityGroupRule
+    properties:
+      security_group: {get_resource: internal_security_group}
+      direction: ingress
+      protocol: tcp
+      port_range_min: 22
+      port_range_max: 22
+  internal_security_group_rule_http:
+    type: OS::Neutron::SecurityGroupRule
+    properties:
+      security_group: {get_resource: internal_security_group}
+      direction: ingress
+      protocol: tcp
+      port_range_min: 80
+      port_range_max: 80
+      # NOTE: Must be the internal subnet CIDR, not the security group,
+      # as the load balancer is not part of that security group.
+      remote_ip_prefix: {get_param: subnet_cidr}
+
+  # The bastion host for accessing the network externally.
+  bastion_server:
+    type: OS::Nova::Server
+    properties:
+      image: {get_param: bastion_image}
+      flavor: {get_param: bastion_flavor}
+      networks:
+        - network: {get_resource: network}
+      key_name: {get_param: keypair}
+      security_groups:
+        - {get_resource: internal_security_group}
+
+  # The floating IP to attach to the bastion host.
+  bastion_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: {get_param: public_network}
+      port_id: {get_attr: [bastion_server, addresses, {get_resource: network}, 0, port]}
+
+  # The loadbalancer for the web server cluster,
+  # including the floating IP allocated to it and
+  # related listener and pool configuration.
+  loadbalancer:
+    type: OS::Octavia::LoadBalancer
+    properties:
+      vip_subnet: {get_resource: subnet}
+  loadbalancer_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: {get_param: public_network}
+      port_id: {get_attr: [loadbalancer, vip_port_id]}
+  loadbalancer_listener:
+    type: OS::Octavia::Listener
+    properties:
+      protocol: HTTP
+      protocol_port: 80
+      loadbalancer: {get_resource: loadbalancer}
+  loadbalancer_pool:
+    type: OS::Octavia::Pool
+    properties:
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      listener: {get_resource: loadbalancer_listener}
+
+  # The server group for the cluster of web servers.
+  webserver_group:
+    type: OS::Nova::ServerGroup
+    properties:
+      policies:
+        - {get_param: webserver_group_policy}
+
+  # The auto-scaling group for provisioning web servers.
+  autoscaling_group:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 2
+      max_size: 4
+      resource:
+        type: OS::Autoscaling::Webserver
+        properties:
+          keypair: {get_param: keypair}
+          flavor: {get_param: webserver_flavor}
+          image: {get_param: webserver_image}
+          network: {get_resource: network}
+          security_groups:
+            - {get_resource: internal_security_group}
+          group: {get_resource: webserver_group}
+          loadbalancer_pool: {get_resource: loadbalancer_pool}
+
+  # The policy for scaling out web servers when load is high.
+  autoscaling_up_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: autoscaling_group}
+      scaling_adjustment: 1
+      cooldown: 60
+
+  # The policy for scaling in web servers when load is low.
+  autoscaling_down_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: autoscaling_group}
+      scaling_adjustment: -1
+      cooldown: 60
+
+  # The alarm that triggers a scale out when CPU usage exceeds the threshold.
+  autoscaling_cpu_high_alarm:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description:
+        str_replace:
+          template: Scale out if average CPU usage exceeds threshold%
+          params:
+            threshold: {get_param: autoscaling_cpu_high_threshold}
+      resource_type: instance
+      metric: cpu
+      aggregation_method: "rate:mean"
+      granularity: {get_param: autoscaling_granularity}
+      threshold:
+        yaql:
+          # 10^9 nanoseconds * number of vCPUs * granularity in seconds * (threshold in percent / 100)
+          expression: >-
+            1000000000
+            * int(regex("^c[^.]\.c([0-9]+).*$").replace($.data.flavor, "\g<1>"))
+            * $.data.granularity
+            * (float($.data.threshold) / 100)
+          data:
+            flavor: {get_param: webserver_flavor}
+            granularity: {get_param: autoscaling_granularity}
+            threshold: {get_param: autoscaling_cpu_high_threshold}
+      query:
+        str_replace:
+          template: '{"and": [{"=": {"server_group": "group_id"}}, {"=": {"ended_at": null}}]}'
+          params:
+            group_id: {get_resource: webserver_group}
+      comparison_operator: gt
+      evaluation_periods: 1
+      alarm_actions:
+        - {get_attr: [autoscaling_up_policy, alarm_url]}
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [autoscaling_up_policy, signal_url]}
+      repeat_actions: true
+
+  # The alarm that triggers a scale in when CPU usage goes below the threshold.
+  autoscaling_cpu_low_alarm:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description:
+        str_replace:
+          template: Scale in if average CPU usage goes below threshold%
+          params:
+            threshold: {get_param: autoscaling_cpu_low_threshold}
+      resource_type: instance
+      metric: cpu
+      aggregation_method: "rate:mean"
+      granularity: {get_param: autoscaling_granularity}
+      threshold:
+        yaql:
+          # 10^9 nanoseconds * number of vCPUs * granularity in seconds * (threshold in percent / 100)
+          expression: >-
+            1000000000
+            * int(regex("^c[^.]\.c([0-9]+).*$").replace($.data.flavor, "\g<1>"))
+            * $.data.granularity
+            * (float($.data.threshold) / 100)
+          data:
+            flavor: {get_param: webserver_flavor}
+            granularity: {get_param: autoscaling_granularity}
+            threshold: {get_param: autoscaling_cpu_low_threshold}
+      query:
+        str_replace:
+          template: '{"and": [{"=": {"server_group": "group_id"}}, {"=": {"ended_at": null}}]}'
+          params:
+            group_id: {get_resource: webserver_group}
+      comparison_operator: lt
+      evaluation_periods: 1
+      alarm_actions:
+        - {get_attr: [autoscaling_down_policy, alarm_url]}
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [autoscaling_down_policy, signal_url]}
+      repeat_actions: true
+
+  # The alarm that triggers a scale out when memory usage exceeds the threshold.
+  autoscaling_memory_high_alarm:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description:
+        str_replace:
+          template: Scale out if average memory usage exceeds threshold%
+          params:
+            threshold: {get_param: autoscaling_memory_high_threshold}
+      resource_type: instance
+      metric: memory.usage
+      aggregation_method: mean
+      granularity: {get_param: autoscaling_granularity}
+      threshold:
+        yaql:
+          # RAM in GiB * 1024 to convert to MiB * (threshold in percent / 100)
+          expression: >-
+            int(regex("^c[^.]\.c[0-9]+r([0-9]+).*$").replace($.data.flavor, "\g<1>"))
+            * 1024
+            * (float($.data.threshold) / 100)
+          data:
+            flavor: {get_param: webserver_flavor}
+            threshold: {get_param: autoscaling_memory_high_threshold}
+      query:
+        str_replace:
+          template: '{"and": [{"=": {"server_group": "group_id"}}, {"=": {"ended_at": null}}]}'
+          params:
+            group_id: {get_resource: webserver_group}
+      comparison_operator: gt
+      evaluation_periods: 1
+      alarm_actions:
+        - {get_attr: [autoscaling_up_policy, alarm_url]}
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [autoscaling_up_policy, signal_url]}
+      repeat_actions: true
+
+  # The alarm that triggers a scale in when memory usage goes below the threshold.
+  autoscaling_memory_low_alarm:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description:
+        str_replace:
+          template: Scale in if average memory usage goes below threshold%
+          params:
+            threshold: {get_param: autoscaling_memory_low_threshold}
+      resource_type: instance
+      metric: memory.usage
+      aggregation_method: mean
+      granularity: {get_param: autoscaling_granularity}
+      threshold:
+        yaql:
+          # RAM in GiB * 1024 to convert to MiB * (threshold in percent / 100)
+          expression: >-
+            int(regex("^c[^.]\.c[0-9]+r([0-9]+).*$").replace($.data.flavor, "\g<1>"))
+            * 1024
+            * (float($.data.threshold) / 100)
+          data:
+            flavor: {get_param: webserver_flavor}
+            threshold: {get_param: autoscaling_memory_low_threshold}
+      query:
+        str_replace:
+          template: '{"and": [{"=": {"server_group": "group_id"}}, {"=": {"ended_at": null}}]}'
+          params:
+            group_id: {get_resource: webserver_group}
+      comparison_operator: lt
+      evaluation_periods: 1
+      alarm_actions:
+        - {get_attr: [autoscaling_down_policy, alarm_url]}
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [autoscaling_down_policy, signal_url]}
+      repeat_actions: true
+
+# Values to return to parent templates.
+outputs:
+  bastion_floating_ip:
+    value: {get_attr: [bastion_floating_ip, floating_ip_address]}
+  loadbalancer_floating_ip:
+    value: {get_attr: [loadbalancer_floating_ip, floating_ip_address]}
+  autoscaling_up_url:
+    value: {get_attr: [autoscaling_up_policy, alarm_url]}
+  autoscaling_down_url:
+    value: {get_attr: [autoscaling_down_policy, alarm_url]}
+  autoscaling_up_signal_url:
+    value: {get_attr: [autoscaling_up_policy, signal_url]}
+  autoscaling_down_signal_url:
+    value: {get_attr: [autoscaling_down_policy, signal_url]}
