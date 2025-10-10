@@ -51,10 +51,14 @@ parameters:
     description: The public network to get floating IPs from.
     type: string
     default: public-net
-  autoscaling_granularity:
-    description: The granularity to query metrics for auto-scaling.
+  autoscaling_min_size:
+    description: The minimum number of web servers to launch in the auto-scaling group.
     type: number
-    default: 600
+    default: 2
+  autoscaling_max_size:
+    description: The maximum number of web servers allowed to be launched in the auto-scaling group.
+    type: number
+    default: 4
   autoscaling_cpu_high_threshold:
     description: The upper CPU usage percentage threshold for scaling out the web servers.
     type: number
@@ -71,6 +75,10 @@ parameters:
     description: The lower memory usage percentage threshold for scaling out the web servers.
     type: number
     default: 50
+  autoscaling_granularity:
+    description: The granularity to query metrics for auto-scaling.
+    type: number
+    default: 600
 
 resources:
   # The internal network for the cluster.
@@ -174,8 +182,8 @@ resources:
   autoscaling_group:
     type: OS::Heat::AutoScalingGroup
     properties:
-      min_size: 2
-      max_size: 4
+      min_size: {get_param: autoscaling_min_size}
+      max_size: {get_param: autoscaling_max_size}
       resource:
         type: OS::Autoscaling::Webserver
         properties:
