@@ -203,7 +203,7 @@ resources:
       adjustment_type: change_in_capacity
       auto_scaling_group_id: {get_resource: autoscaling_group}
       scaling_adjustment: 1
-      cooldown: 60
+      cooldown: {get_param: autoscaling_granularity}
 
   # The policy for scaling in web servers when load is low.
   autoscaling_down_policy:
@@ -212,7 +212,7 @@ resources:
       adjustment_type: change_in_capacity
       auto_scaling_group_id: {get_resource: autoscaling_group}
       scaling_adjustment: -1
-      cooldown: 60
+      cooldown: {get_param: autoscaling_granularity}
 
   # The alarm that triggers a scale out when CPU usage exceeds the threshold.
   autoscaling_cpu_high_alarm:
