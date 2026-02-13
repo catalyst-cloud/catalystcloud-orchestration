@@ -1,10 +1,11 @@
 ---
 
-heat_template_version: 2016-10-14
+heat_template_version: 2018-08-31
 
 description: |-
   An example Catalyst Cloud Orchestration Service template
-  for building a cluster of web servers with auto-scaling.
+  for building a cluster of web servers with auto-scaling
+  and optional auto-healing.
 
   This provisions the following cloud resources:
 
@@ -17,6 +18,9 @@ description: |-
   * An auto-scaling group that launches, monitors and scales
     a cluster of web server instances depending on the configured
     load thresholds.
+  * (Optional) Another alarm that monitors the health of auto-scaling
+    group members, and automatically replaces them if they stop serving
+    requests.
 
 parameters:
   keypair:
@@ -51,6 +55,18 @@ parameters:
     description: The public network to get floating IPs from.
     type: string
     default: public-net
+  loadbalancer_healthmonitor_timeout:
+    description: The request timeout for load balancer member health checks, in seconds.
+    type: number
+    default: 3
+  loadbalancer_healthmonitor_max_retries:
+    description: The maximum number of retries for load balancer member health checks.
+    type: number
+    default: 3
+  loadbalancer_healthmonitor_delay:
+    description: The interval between load balancer member health checks, in seconds.
+    type: number
+    default: 10
   autoscaling_min_size:
     description: The minimum number of web servers to launch in the auto-scaling group.
     type: number
@@ -79,6 +95,13 @@ parameters:
     description: The granularity to query metrics for auto-scaling.
     type: number
     default: 600
+  autoscaling_autohealing_enable:
+    description: Enable auto-healing for auto-scaling group members.
+    type: boolean
+    default: false
+
+conditions:
+  autoscaling_autohealing_enabled: {equals: [{get_param: autoscaling_autohealing_enable}, true]}
 
 resources:
   # The internal network for the cluster.
@@ -148,7 +171,7 @@ resources:
 
   # The loadbalancer for the web server cluster,
   # including the floating IP allocated to it and
-  # related listener and pool configuration.
+  # listener, pool and health monitor configuration.
   loadbalancer:
     type: OS::Octavia::LoadBalancer
     properties:
@@ -170,6 +193,17 @@ resources:
       lb_algorithm: ROUND_ROBIN
       protocol: HTTP
       listener: {get_resource: loadbalancer_listener}
+  # NOTE: A health monitor is required for auto-healing,
+  # but is always created because it does not need to be
+  # disabled when auto-healing is not used.
+  loadbalancer_healthmonitor:
+    type: OS::Octavia::HealthMonitor
+    properties:
+      pool: {get_resource: loadbalancer_pool}
+      type: HTTP
+      timeout: {get_param: loadbalancer_healthmonitor_timeout}
+      max_retries: {get_param: loadbalancer_healthmonitor_max_retries}
+      delay: {get_param: loadbalancer_healthmonitor_delay}
 
   # The server group for the cluster of web servers.
   webserver_group:
@@ -369,6 +403,20 @@ resources:
             params:
               url: {get_attr: [autoscaling_down_policy, signal_url]}
       repeat_actions: true
+
+  # The alarm that triggers replacement of auto-scaling members that have stopped
+  # responding to requests.
+  autoscaling_member_health_alarm:
+    condition: autoscaling_autohealing_enabled
+    type: OS::Aodh::LBMemberHealthAlarm
+    properties:
+      description: Replace members that have stopped serving requests
+      stack: {get_param: OS::stack_id}
+      pool: {get_resource: loadbalancer_pool}
+      autoscaling_group_id: {get_resource: autoscaling_group}
+      alarm_actions:
+        - trust+heat://
+      repeat_actions: false
 
 # Values to return to parent templates.
 outputs:
